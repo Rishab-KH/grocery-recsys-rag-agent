@@ -1,11 +1,14 @@
 import os
+import numpy as np
 import pandas as pd
-from typing import Tuple, Dict
+import torch
+from typing import Dict, Tuple
 
 
 def load_and_merge_data(data_dir: str = '.') -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Load orders and order_products (prior + train) and merge into a single interaction frame.
+    Interactions include the 'reordered' flag for downstream feature computation.
     """
     orders_path = os.path.join(data_dir, 'orders.csv')
     prior_path = os.path.join(data_dir, 'order_products__prior.csv')
@@ -17,63 +20,112 @@ def load_and_merge_data(data_dir: str = '.') -> Tuple[pd.DataFrame, pd.DataFrame
 
     order_products = pd.concat([prior, train], ignore_index=True)
 
-    # Merge orders with products to get user-level interactions
     interactions = orders.merge(order_products, on='order_id', how='inner')
-    # Keep only relevant columns
-    interactions = interactions[['user_id', 'order_id', 'order_number', 'product_id']]
+    interactions = interactions[['user_id', 'order_id', 'order_number', 'product_id', 'reordered']]
     return orders, interactions, order_products
 
 
+def load_products(data_dir: str = '.') -> pd.DataFrame:
+    """Load product catalog: product_id, aisle_id, department_id."""
+    return pd.read_csv(
+        os.path.join(data_dir, 'products.csv'),
+        usecols=['product_id', 'aisle_id', 'department_id'],
+    )
+
+
 def filter_active_users(orders: pd.DataFrame, interactions: pd.DataFrame, min_orders: int = 3):
-    """
-    Keep only users with at least `min_orders` total orders.
-    Temporal split requires a sufficiently long history per user.
-    """
+    """Keep only users with at least `min_orders` total orders."""
     user_max = orders.groupby('user_id')['order_number'].max().reset_index()
     active_users = user_max[user_max['order_number'] >= min_orders]['user_id']
-    interactions = interactions[interactions['user_id'].isin(active_users)].copy()
-    return interactions
+    return interactions[interactions['user_id'].isin(active_users)].copy()
 
 
 def temporal_train_test_split(interactions: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    For each user, put all orders with order_number < max(order_number) into train,
-    and the last order (order_number == max) into test.
-
-    Why temporal split: ensures no future information is used to predict past behavior,
-    reflecting realistic next-basket prediction.
+    For each user: last order → test, everything before → train.
+    Temporal split ensures no future information leaks into training.
     """
-    # compute the last order number per user
     last = interactions.groupby('user_id')['order_number'].max().rename('last_order').reset_index()
-    df = interactions.merge(last, on='user_id', how='inner')
-
-    train = df[df['order_number'] < df['last_order']].copy()
-    test = df[df['order_number'] == df['last_order']].copy()
-
-    # Safety: drop the helper column
-    train = train[['user_id', 'order_id', 'order_number', 'product_id']]
-    test = test[['user_id', 'order_id', 'order_number', 'product_id']]
+    df = interactions.merge(last, on='user_id')
+    cols = ['user_id', 'order_id', 'order_number', 'product_id', 'reordered']
+    train = df[df['order_number'] < df['last_order']][cols].copy()
+    test = df[df['order_number'] == df['last_order']][cols].copy()
     return train, test
 
 
-def build_mappings(train: pd.DataFrame, test: pd.DataFrame) -> Tuple[Dict[int, int], Dict[int, int]]:
+def temporal_val_split(train_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Create user and product id -> compact integer index mappings.
-    Only include products that appear in training set for the item vocabulary to avoid leakage.
+    From the training split, hold out each user's last order as validation.
+    Mirrors the test split logic — no random shuffling, strictly temporal.
+    Users with only one training order are kept in train (val would be empty for them).
+    """
+    last = train_df.groupby('user_id')['order_number'].max().rename('last_train_order').reset_index()
+    df = train_df.merge(last, on='user_id')
+    cols = ['user_id', 'order_id', 'order_number', 'product_id', 'reordered']
+    val = df[df['order_number'] == df['last_train_order']][cols].copy()
+    train = df[df['order_number'] < df['last_train_order']][cols].copy()
+    return train, val
+
+
+def build_mappings(train: pd.DataFrame, test: pd.DataFrame) -> Tuple[Dict, Dict]:
+    """
+    Compact integer index mappings for users and products.
+    Product vocabulary built from training only — avoids test leakage.
     """
     users = pd.Index(train['user_id'].unique()).sort_values()
     user2idx = {u: i for i, u in enumerate(users)}
 
-    # Build product vocabulary from training interactions (no leakage)
     products = pd.Index(train['product_id'].unique()).sort_values()
     prod2idx = {p: i for i, p in enumerate(products)}
-
     return user2idx, prod2idx
 
 
-def interactions_to_indices(df: pd.DataFrame, user2idx: Dict[int, int], prod2idx: Dict[int, int]) -> pd.DataFrame:
+def build_content_mappings(products: pd.DataFrame) -> Tuple[Dict, Dict]:
+    """Build compact integer mappings for aisle_id and department_id."""
+    aisles = pd.Index(products['aisle_id'].unique()).sort_values()
+    aisle2idx = {a: i for i, a in enumerate(aisles)}
+
+    depts = pd.Index(products['department_id'].unique()).sort_values()
+    dept2idx = {d: i for i, d in enumerate(depts)}
+    return aisle2idx, dept2idx
+
+
+def get_item_content_tensors(
+    prod2idx: Dict,
+    aisle2idx: Dict,
+    dept2idx: Dict,
+    products: pd.DataFrame,
+) -> Tuple[torch.LongTensor, torch.LongTensor]:
     """
-    Map raw ids to indices. Rows with products not in prod2idx are dropped to avoid leakage.
+    Build per-item content tensors:
+      item_aisle[item_idx] → aisle compact index
+      item_dept[item_idx]  → department compact index
+    Items missing from products.csv default to index 0.
+    """
+    num_items = len(prod2idx)
+    item_aisle = torch.zeros(num_items, dtype=torch.long)
+    item_dept = torch.zeros(num_items, dtype=torch.long)
+
+    prod_to_aisle = dict(zip(products['product_id'], products['aisle_id']))
+    prod_to_dept = dict(zip(products['product_id'], products['department_id']))
+
+    for prod_id, idx in prod2idx.items():
+        a = prod_to_aisle.get(prod_id)
+        d = prod_to_dept.get(prod_id)
+        if a is not None and a in aisle2idx:
+            item_aisle[idx] = aisle2idx[a]
+        if d is not None and d in dept2idx:
+            item_dept[idx] = dept2idx[d]
+
+    return item_aisle, item_dept
+
+
+def interactions_to_indices(
+    df: pd.DataFrame, user2idx: Dict, prod2idx: Dict
+) -> pd.DataFrame:
+    """
+    Map raw ids → compact indices. Rows with unknown products are dropped.
+    Preserves 'reordered' column when present.
     """
     df = df.copy()
     df['user_idx'] = df['user_id'].map(user2idx)
@@ -81,13 +133,63 @@ def interactions_to_indices(df: pd.DataFrame, user2idx: Dict[int, int], prod2idx
     df = df.dropna(subset=['user_idx', 'product_idx'])
     df['user_idx'] = df['user_idx'].astype(int)
     df['product_idx'] = df['product_idx'].astype(int)
-    return df[['user_id', 'order_id', 'order_number', 'product_id', 'user_idx', 'product_idx']]
+    base_cols = ['user_id', 'order_id', 'order_number', 'product_id', 'user_idx', 'product_idx']
+    extra = [c for c in ['reordered'] if c in df.columns]
+    return df[base_cols + extra]
 
 
-def get_popularity(train: pd.DataFrame, prod2idx: Dict[int, int]):
-    """
-    Compute global popularity ranking (by training interactions). Returns list of product_idx sorted by popularity desc.
-    """
+def get_popularity(train: pd.DataFrame, prod2idx: Dict):
+    """Global popularity ranking by training frequency. Returns list of product_idx desc."""
     counts = train['product_id'].map(prod2idx).dropna().astype(int).value_counts()
-    popular = counts.index.tolist()
-    return popular
+    return counts.index.tolist()
+
+
+def get_item_reorder_rates(train_indexed: pd.DataFrame, num_items: int) -> np.ndarray:
+    """
+    Per-item reorder rate = fraction of purchases that were reorders.
+    Items with no data default to 0.0.
+    """
+    rates = np.zeros(num_items, dtype=np.float32)
+    if 'reordered' not in train_indexed.columns:
+        return rates
+    grp = train_indexed.groupby('product_idx')['reordered'].agg(['sum', 'count'])
+    valid = grp[grp['count'] > 0]
+    rates[valid.index.values] = (valid['sum'] / valid['count']).values.astype(np.float32)
+    return rates
+
+
+def get_user_reorder_rates(train_indexed: pd.DataFrame, num_users: int) -> np.ndarray:
+    """Per-user reorder rate = fraction of their training purchases that were reorders."""
+    rates = np.zeros(num_users, dtype=np.float32)
+    if 'reordered' not in train_indexed.columns:
+        return rates
+    grp = train_indexed.groupby('user_idx')['reordered'].agg(['sum', 'count'])
+    valid = grp[grp['count'] > 0]
+    rates[valid.index.values] = (valid['sum'] / valid['count']).values.astype(np.float32)
+    return rates
+
+
+def get_user_stats(
+    train_indexed: pd.DataFrame,
+    orders: pd.DataFrame,
+    user2idx: Dict,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+        user_order_counts[user_idx]: total order count per user (from orders table)
+        user_hist_sizes[user_idx]:   distinct items purchased in training per user
+    """
+    num_users = len(user2idx)
+    user_order_counts = np.zeros(num_users, dtype=np.float32)
+    user_hist_sizes = np.zeros(num_users, dtype=np.float32)
+
+    order_cnt = orders.groupby('user_id')['order_number'].max()
+    for uid, cnt in order_cnt.items():
+        idx = user2idx.get(uid)
+        if idx is not None:
+            user_order_counts[idx] = cnt
+
+    hist = train_indexed.groupby('user_idx')['product_idx'].nunique()
+    user_hist_sizes[hist.index.values] = hist.values.astype(np.float32)
+
+    return user_order_counts, user_hist_sizes

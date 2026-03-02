@@ -1,91 +1,175 @@
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import torch
 import faiss
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from model import TwoTowerModel
-from data_processing import build_mappings, interactions_to_indices
+from data_processing import (
+    load_and_merge_data,
+    filter_active_users,
+    temporal_train_test_split,
+    build_mappings,
+    interactions_to_indices,
+)
 from evaluate import evaluate_recommendations
 
-# Load the trained model and mappings
-def load_model_and_mappings(version):
-    model_path = f'./models/version_{version}/model.pt'
-    mappings_path = f'./models/version_{version}/mappings.pt'
 
-    mappings = torch.load(mappings_path)
+def resolve_model_dir(model_dir: str | None) -> str:
+    """Resolve model directory; auto-pick latest version if not provided."""
+    if model_dir:
+        candidate = Path(model_dir)
+        if candidate.exists():
+            return str(candidate)
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
+
+    models_root = Path('./models')
+    version_dirs = sorted(
+        [p for p in models_root.glob('version_*') if p.is_dir()],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    if not version_dirs:
+        raise FileNotFoundError("No model versions found in ./models (expected ./models/version_*)")
+    return str(version_dirs[0])
+
+
+def load_model_and_mappings(model_dir: str):
+    """
+    Load the trained model and all mappings/content tensors from a model directory.
+    Model architecture parameters are read from the saved mappings file — no hardcoding.
+    """
+    model_path = os.path.join(model_dir, 'model.pt')
+    mappings_path = os.path.join(model_dir, 'mappings.pt')
+
+    mappings = torch.load(mappings_path, map_location='cpu')
     user2idx = mappings['user2idx']
     prod2idx = mappings['prod2idx']
+    item_aisle = mappings['item_aisle']
+    item_dept = mappings['item_dept']
+    cfg = mappings['model_config']
 
-    model = TwoTowerModel(num_users=len(user2idx), num_items=len(prod2idx), emb_dim=128)
-    model.load_state_dict(torch.load(model_path))
+    model = TwoTowerModel(
+        num_users=len(user2idx),
+        num_items=len(prod2idx),
+        num_aisles=cfg['num_aisles'],
+        num_depts=cfg['num_depts'],
+        emb_dim=cfg['emb_dim'],
+        hidden_dim=cfg['hidden_dim'],
+    )
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
     model.eval()
 
-    return model, user2idx, prod2idx
+    return model, user2idx, prod2idx, item_aisle, item_dept
 
-# Build FAISS index for item embeddings
-def build_faiss_index(item_embs):
+
+def build_faiss_index(model: TwoTowerModel, item_aisle: torch.LongTensor, item_dept: torch.LongTensor):
+    """Build a FAISS inner-product index over all L2-normalized item embeddings."""
+    with torch.no_grad():
+        item_embs = model.get_all_item_embeddings(item_aisle, item_dept).numpy().astype('float32')
     faiss.normalize_L2(item_embs)
     index = faiss.IndexFlatIP(item_embs.shape[1])
     index.add(item_embs)
     return index
 
-# Perform inference for a single user
-def infer_for_user(model, user_id, user2idx, prod2idx, index, k=10):
-    user_idx = torch.tensor([user2idx[user_id]], dtype=torch.long)
-    user_emb = model.get_user_embedding(user_idx).detach().numpy()
-    faiss.normalize_L2(user_emb)
 
-    scores, indices = index.search(user_emb, k)
-    recommended_products = [list(prod2idx.keys())[list(prod2idx.values()).index(idx)] for idx in indices[0]]
-    return recommended_products, scores[0]
+def infer_batch(model: TwoTowerModel, user_indices: list, index, k: int = 20):
+    """Retrieve top-k items for a batch of users."""
+    user_idx_tensor = torch.tensor(user_indices, dtype=torch.long)
+    with torch.no_grad():
+        user_embs = model.get_user_embedding(user_idx_tensor).numpy().astype('float32')
+    faiss.normalize_L2(user_embs)
+    scores, indices = index.search(user_embs, k)  # FAISS returns (D, I)
+    return indices, scores
 
-# Load data and filter unseen users
-def load_data_and_filter_unseen(data_dir, train_users):
-    orders = pd.read_csv(f"{data_dir}/orders.csv")
-    train_orders = orders[orders['eval_set'] == 'train']
-    test_orders = orders[orders['eval_set'] == 'test']
 
-    # Get users in training and testing sets
-    train_users_set = set(train_orders['user_id'])
-    test_users_set = set(test_orders['user_id'])
+def main(model_dir=None, data_dir='./data/', k=20, num_users=10):
+    """
+    Run inference on test users and evaluate recommendations.
 
-    # Filter unseen users (users in test set but not in training set)
-    unseen_users = test_users_set - train_users_set
+    Args:
+        model_dir: Path to the saved model directory (default: auto-select latest)
+        data_dir: Path to the data directory
+        k: Number of recommendations to retrieve
+        num_users: Number of users to show detailed results for (-1 for all)
+    """
+    model_dir = resolve_model_dir(model_dir)
+    print(f'Loading model and mappings from: {model_dir}')
+    model, user2idx, prod2idx, item_aisle, item_dept = load_model_and_mappings(model_dir)
 
-    # Prepare ground truth for unseen users
-    test_products = pd.read_csv(f"{data_dir}/order_products__train.csv")
-    ground_truth = test_products[test_products['order_id'].isin(test_orders['order_id'])]
-    ground_truth = ground_truth.groupby('order_id')['product_id'].apply(list).to_dict()
+    idx2prod = {v: k for k, v in prod2idx.items()}
+    idx2user = {v: k for k, v in user2idx.items()}
 
-    return unseen_users, ground_truth
+    print('Loading and preprocessing data...')
+    orders, interactions, _ = load_and_merge_data(data_dir)
+    interactions = filter_active_users(orders, interactions, min_orders=3)
+    train_df, test_df = temporal_train_test_split(interactions)
 
-# Main inference function
-def main(version, data_dir):
-    model, user2idx, prod2idx = load_model_and_mappings(version)
+    test_idx = interactions_to_indices(test_df, user2idx, prod2idx)
+    test_by_user = test_idx.groupby('user_idx')['product_idx'].apply(list).to_dict()
+    test_users = list(test_by_user.keys())
 
-    # Generate item embeddings and build FAISS index
-    item_embs = model.get_all_item_embeddings().detach().numpy()
-    index = build_faiss_index(item_embs)
+    print(f'Total test users: {len(test_users)}')
 
-    # Load data and filter unseen users
-    unseen_users, ground_truth = load_data_and_filter_unseen(data_dir, set(user2idx.keys()))
+    print('Building FAISS index...')
+    index = build_faiss_index(model, item_aisle, item_dept)
 
-    # Perform inference for unseen users
-    for user_id in unseen_users:
-        if user_id not in user2idx:
-            continue
+    print(f'Running inference for {len(test_users)} users...')
+    recs_idx, recs_scores = infer_batch(model, test_users, index, k=k)
 
-        recommended_products, scores = infer_for_user(model, user_id, user2idx, prod2idx, index)
-        print(f"Recommended Products for User {user_id}: {recommended_products}")
+    recs = {u: recs_idx[i].tolist() for i, u in enumerate(test_users)}
+    scores_dict = {u: recs_scores[i].tolist() for i, u in enumerate(test_users)}
 
-        # Evaluate results
-        recommendations = {user_id: recommended_products}
-        user_ground_truth = ground_truth.get(user_id, [])
-        results = evaluate_recommendations(recommendations, {user_id: user_ground_truth}, ks=[10, 20])
-        print(f"Evaluation Results for User {user_id}: {results}")
+    results = evaluate_recommendations(recs, test_by_user, ks=[10, 20])
 
-if __name__ == "__main__":
-    # Example usage
-    version = "20260302_123456"  # Replace with your model version
-    data_dir = "./data"  # Path to data directory
+    print('\n' + '=' * 50)
+    print('Overall Retrieval Results:')
+    print('=' * 50)
+    for metric, value in results.items():
+        print(f"  {metric}: {value:.4f}")
 
-    main(version, data_dir)
+    users_to_show = test_users[:num_users] if num_users > 0 else test_users
+
+    print('\n' + '=' * 50)
+    print(f'Detailed Results for {len(users_to_show)} Users:')
+    print('=' * 50)
+
+    for user_idx in users_to_show:
+        user_id = idx2user.get(user_idx, user_idx)
+        ground_truth_items = test_by_user.get(user_idx, [])
+        recommended_items = recs[user_idx][:10]
+        recommended_scores = scores_dict[user_idx][:10]
+
+        gt_product_ids = [idx2prod.get(idx, idx) for idx in ground_truth_items]
+        rec_product_ids = [idx2prod.get(idx, idx) for idx in recommended_items]
+        hits = set(recommended_items) & set(ground_truth_items)
+
+        print(f'\nUser {user_id} (idx={user_idx}):')
+        print(f'  Ground truth items ({len(ground_truth_items)}): {gt_product_ids[:5]}...')
+        print(f'  Recommended items (top 10):')
+        for j, (prod_id, score) in enumerate(zip(rec_product_ids, recommended_scores), 1):
+            hit_marker = ' *HIT*' if recommended_items[j - 1] in ground_truth_items else ''
+            print(f'    {j}. Product {prod_id} (score: {score:.4f}){hit_marker}')
+        recall_at_10 = len(hits) / min(10, len(ground_truth_items)) * 100 if ground_truth_items else 0
+        print(f'  Hits: {len(hits)} ({recall_at_10:.1f}% recall@10)')
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Run inference on the Two-Tower model')
+    parser.add_argument('--model_dir', type=str, default=None,
+                        help='Path to the model directory (default: auto-select latest)')
+    parser.add_argument('--data_dir', type=str, default='./data/',
+                        help='Path to the data directory')
+    parser.add_argument('--k', type=int, default=20,
+                        help='Number of recommendations to retrieve')
+    parser.add_argument('--num_users', type=int, default=10,
+                        help='Number of users to show detailed results for (-1 for all)')
+
+    args = parser.parse_args()
+    main(model_dir=args.model_dir, data_dir=args.data_dir, k=args.k, num_users=args.num_users)
