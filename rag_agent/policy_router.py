@@ -4,7 +4,11 @@ def route_policy_docs(intent: str, departments=None, has_oos_or_low_stock=False,
     """
     intent_lower = intent.lower()
     docs = set()
-    if "delivery" in intent_lower:
+    # Helper: check if keyword appears in any department name (substring match)
+    def _dept_has(keyword: str) -> bool:
+        return departments and any(keyword in d.lower() for d in departments)
+
+    if "delivery" in intent_lower or "perishable" in intent_lower or "fast" in intent_lower:
         docs.add("delivery_windows.md")
         docs.add("cold_chain.md")
     if "substitution" in intent_lower or substitutions_occurred:
@@ -13,20 +17,20 @@ def route_policy_docs(intent: str, departments=None, has_oos_or_low_stock=False,
         docs.add("bulk_limits.md")
     if "promo" in intent_lower:
         docs.add("promo_rules.md")
-    if "organic" in intent_lower or (departments and "produce" in [d.lower() for d in departments]):
+    if "organic" in intent_lower or _dept_has("produce"):
         docs.add("dept_produce.md")
-    if "dairy" in intent_lower or (departments and "dairy" in [d.lower() for d in departments]):
+    if "dairy" in intent_lower or "yogurt" in intent_lower or "milk" in intent_lower or "egg" in intent_lower or _dept_has("dairy"):
         docs.add("dept_dairy_eggs.md")
-    if "frozen" in intent_lower or (departments and "frozen" in [d.lower() for d in departments]):
+    if "frozen" in intent_lower or _dept_has("frozen"):
         docs.add("dept_frozen.md")
-    if "snack" in intent_lower or (departments and "snacks" in [d.lower() for d in departments]):
+    if "snack" in intent_lower or _dept_has("snack"):
         docs.add("dept_snacks.md")
     # Inventory constraints
     if has_oos_or_low_stock:
-        docs.add("inventory_constraints.md")
+        docs.add("substitutions.md")     # substitution rules always relevant for OOS/low-stock
     # Always include general policies if nothing matches
     if not docs:
-        docs.add("general_policies.md")
+        docs.add("substitutions.md")     # safe default — applies broadly
     return list(docs)
 """
 Simulated inventory service — for demo/development purposes only.
