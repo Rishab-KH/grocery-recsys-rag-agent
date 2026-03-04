@@ -115,9 +115,11 @@ def main() -> None:
         for r in results:
             tel = r.get("telemetry_ms", {})
             # Always add DeepEval metric aliases, even if value is missing (set to None)
+            r["faithfulness"] = tel.get("deepeval_faithfulness")
             r["hallucination_rate"] = tel.get("deepeval_hallucination")
-            r["context_recall"] = tel.get("deepeval_retrieval_quality")
-            r["context_precision"] = tel.get("deepeval_retrieval_quality")
+            r["context_recall"] = tel.get("deepeval_context_recall")
+            r["context_precision"] = tel.get("deepeval_context_precision")
+            r["compliance_score"] = tel.get("deepeval_compliance_risk")
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     print(f"\n\n>> Full output + telemetry logged → {OUTPUT_FILE}")
