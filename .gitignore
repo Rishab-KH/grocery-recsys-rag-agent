@@ -37,3 +37,6 @@ metadata.json
 
 # Data files
 data/*.csv
+
+# Environment variables — never commit real keys
+.env
