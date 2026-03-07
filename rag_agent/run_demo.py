@@ -10,9 +10,13 @@ def _hit_rate(final_recs, ground_truth):
     return hits, hit_rate
 from rag_agent.graph import run_pipeline
 DEMO_CASES = [
-    {"user_id": 6, "intent": "fast delivery and substitutions for perishables"},
-    {"user_id": 2, "intent": "bulk staples with promo sensitivity"},
+    {"user_id": 6,  "intent": "fast delivery and substitutions for perishables"},
+    {"user_id": 2,  "intent": "bulk staples with promo sensitivity"},
     {"user_id": 10, "intent": "substitutions only; keep organic preferences"},
+    {"user_id": 1,  "intent": "snack variety with refund protection"},
+    {"user_id": 17, "intent": "frozen meal prep with cold chain compliance"},
+    {"user_id": 4,  "intent": "household restock with promo deals"},
+    {"user_id": 9,  "intent": "dairy essentials with substitution flexibility"},
 ]
 #!/usr/bin/env python3
 """
@@ -126,4 +130,20 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import warnings
+    import asyncio
+
+    # Suppress harmless "Event loop is closed" noise from httpx/OpenAI
+    # async-client teardown on Python 3.14.
+    warnings.filterwarnings("ignore", message="coroutine.*was never awaited")
+
     main()
+
+    # Forcefully shut down any remaining async generators / transports
+    # so httpx doesn't complain after the loop is gone.
+    try:
+        loop = asyncio.get_event_loop()
+        if not loop.is_closed():
+            loop.run_until_complete(asyncio.sleep(0))
+    except RuntimeError:
+        pass

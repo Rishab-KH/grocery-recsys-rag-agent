@@ -246,61 +246,55 @@ def train_pipeline(
             if num_random > 0:
                 rand_idx = torch.multinomial(item_probs, num_samples=B * num_random, replacement=True).view(B, num_random)
 
-            # Merge & filter per-user (exclude train positives and current positive)
-            neg_lists = []
-            for i, u in enumerate(batch_users):
-                pos_set = user_pos_dict.get(int(u), set()) if user_pos_dict is not None else set()
-                cur_pos = int(pos_idx[i].item())
+            # Merge all negative sources into (B, Hmax) tensor — vectorized
+            Hmax = num_hard + num_semihard + num_random
+            all_neg = torch.full((B, Hmax), -1, dtype=torch.long, device=device)
+            col = 0
+            if num_hard > 0:
+                hard_pad = torch.full((B, num_hard), -1, dtype=torch.long, device=device)
+                for i, h in enumerate(hard_lists):
+                    if h:
+                        hl = min(len(h), num_hard)
+                        hard_pad[i, :hl] = torch.tensor(h[:hl], dtype=torch.long, device=device)
+                all_neg[:, col:col + num_hard] = hard_pad
+                col += num_hard
+            if num_semihard > 0:
+                all_neg[:, col:col + num_semihard] = semi_idx
+                col += num_semihard
+            if num_random > 0:
+                all_neg[:, col:col + num_random] = rand_idx
 
-                merged = []
-                merged.extend(hard_lists[i])
-                if num_semihard > 0:
-                    merged.extend([int(x) for x in semi_idx[i].tolist() if x >= 0])
-                if num_random > 0:
-                    merged.extend([int(x) for x in rand_idx[i].tolist() if x >= 0])
+            # Vectorized filtering: mask out padding, current positives, known positives
+            hard_mask = all_neg >= 0
+            hard_mask &= all_neg != pos_idx.unsqueeze(1)
+            if user_pos_dict is not None:
+                for i, u in enumerate(batch_users):
+                    pos_set = user_pos_dict.get(int(u))
+                    if pos_set:
+                        row = all_neg[i]
+                        pos_t = torch.tensor(list(pos_set), dtype=torch.long, device=device)
+                        hard_mask[i] &= ~(row.unsqueeze(1) == pos_t.unsqueeze(0)).any(dim=1)
 
-                # stable dedupe while filtering positives
-                seen = set()
-                filtered = []
-                for it in merged:
-                    if it == cur_pos or it in pos_set or it in seen:
-                        continue
-                    seen.add(it)
-                    filtered.append(it)
-                neg_lists.append(filtered)
+            hard_idx = all_neg
 
-            Hmax = max((len(h) for h in neg_lists), default=0)
+            # Safe embedding lookup; padded entries are masked out afterwards.
+            safe_hard_idx = torch.clamp(hard_idx, min=0)
+            hard_emb = model.get_item_embedding(
+                safe_hard_idx.view(-1),
+                item_aisle[safe_hard_idx.view(-1)],
+                item_dept[safe_hard_idx.view(-1)],
+            ).view(B, Hmax, -1)  # (B, Hmax, D)
 
-            if Hmax > 0:
-                hard_idx = torch.full((B, Hmax), -1, dtype=torch.long, device=device)
-                hard_mask = torch.zeros((B, Hmax), dtype=torch.bool, device=device)
+            hard_logits = (hard_emb * user_emb.unsqueeze(1)).sum(dim=2) / temperature  # (B, Hmax)
+            hard_logits = hard_logits.masked_fill(~hard_mask, -1e9)
 
-                for i, h in enumerate(neg_lists):
-                    if not h:
-                        continue
-                    h_tensor = torch.tensor(h, dtype=torch.long, device=device)
-                    h_len = h_tensor.numel()
-                    hard_idx[i, :h_len] = h_tensor
-                    hard_mask[i, :h_len] = True
+            pos_logits = (user_emb * pos_emb).sum(dim=1, keepdim=True) / temperature  # (B, 1)
+            logits_hard = torch.cat([pos_logits, hard_logits], dim=1)  # (B, 1+Hmax)
 
-                # Safe embedding lookup; padded entries are masked out afterwards.
-                safe_hard_idx = torch.clamp(hard_idx, min=0)
-                hard_emb = model.get_item_embedding(
-                    safe_hard_idx.view(-1),
-                    item_aisle[safe_hard_idx.view(-1)],
-                    item_dept[safe_hard_idx.view(-1)],
-                ).view(B, Hmax, -1)  # (B, Hmax, D)
-
-                hard_logits = (hard_emb * user_emb.unsqueeze(1)).sum(dim=2) / temperature  # (B, Hmax)
-                hard_logits = hard_logits.masked_fill(~hard_mask, -1e9)
-
-                pos_logits = (user_emb * pos_emb).sum(dim=1, keepdim=True) / temperature  # (B, 1)
-                logits_hard = torch.cat([pos_logits, hard_logits], dim=1)  # (B, 1+Hmax)
-
-                valid_rows = hard_mask.any(dim=1)
-                if valid_rows.any():
-                    hard_labels = torch.zeros(valid_rows.sum(), dtype=torch.long, device=device)
-                    loss_hard = criterion(logits_hard[valid_rows], hard_labels)
+            valid_rows = hard_mask.any(dim=1)
+            if valid_rows.any():
+                hard_labels = torch.zeros(valid_rows.sum(), dtype=torch.long, device=device)
+                loss_hard = criterion(logits_hard[valid_rows], hard_labels)
 
         loss = loss_inbatch + alpha_hard_neg * loss_hard
 
@@ -603,7 +597,7 @@ def main(
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
     best_val_loss = float('inf')
-    patience = 4  # increased from 2 — avoids premature early stopping
+    patience = 2  # increased from 2 — avoids premature early stopping
     patience_counter = 0
     hard_neg_dict = None  # populated after epoch 1
 
@@ -664,12 +658,12 @@ def main(
                     tqdm.write('Early stopping triggered.')
                     break
 
-            # Mine hard negatives every 2 epochs (expensive FAISS search)
-            if epoch % 2 == 0:
-                tqdm.write('  Mining hard negatives...')
-                hard_neg_dict = mine_hard_negatives(
-                    model, train_idx, item_aisle, item_dept, device, k=50, num_hard=5
-                )
+            # Mine hard negatives after each epoch
+            tqdm.write('  Mining hard negatives...')
+            hard_neg_dict = mine_hard_negatives(
+                model, train_idx, item_aisle, item_dept, device,
+                k=50, num_hard=num_hard, sample_frac=0.35,
+            )
 
     # Reload best checkpoint
     # weights_only=True: model.pt contains only tensor weights (state_dict) — safe to restrict.

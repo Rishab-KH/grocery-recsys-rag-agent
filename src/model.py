@@ -6,12 +6,14 @@ import torch.nn.functional as F
 class TwoTowerModel(nn.Module):
     """
     Two-tower (bi-encoder) model with:
-    - User tower: user embedding → MLP → L2-normalized output
-    - Item tower: concat(item_emb, aisle_emb, dept_emb) → MLP → L2-normalized output
+    - User tower: user embedding → 3-layer MLP with residual + LayerNorm → L2-normalized output
+    - Item tower: concat(item_emb, aisle_emb, dept_emb) → 3-layer MLP with residual + LayerNorm → L2-normalized output
 
-    Content embeddings (aisle, department) allow the item tower to generalize across
-    products sharing catalog structure, addressing cold-start and improving retrieval quality.
-    MLP towers enable non-linear feature interactions vs. pure lookup tables.
+    Improvements over the baseline 2-layer model:
+    - Deeper 3-layer MLPs increase representational capacity
+    - Residual connections prevent gradient degradation and preserve embedding identity
+    - LayerNorm stabilises training with hard negatives and mixed-precision
+    - GELU activation (smoother than ReLU) consistently outperforms in retrieval models
     """
 
     AISLE_EMB_DIM = 32
@@ -30,16 +32,21 @@ class TwoTowerModel(nn.Module):
         self.emb_dim = emb_dim
         self.hidden_dim = hidden_dim
 
-        # --- User tower ---
+        # --- User tower (3-layer with residual) ---
         self.user_emb = nn.Embedding(num_users, emb_dim)
         self.user_tower = nn.Sequential(
             nn.Linear(emb_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, emb_dim),
         )
 
-        # --- Item tower ---
+        # --- Item tower (3-layer with residual) ---
         self.item_emb = nn.Embedding(num_items, emb_dim)
         self.aisle_emb = nn.Embedding(num_aisles, self.AISLE_EMB_DIM)
         self.dept_emb = nn.Embedding(num_depts, self.DEPT_EMB_DIM)
@@ -47,10 +54,17 @@ class TwoTowerModel(nn.Module):
         item_input_dim = emb_dim + self.AISLE_EMB_DIM + self.DEPT_EMB_DIM
         self.item_tower = nn.Sequential(
             nn.Linear(item_input_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, emb_dim),
         )
+        # Linear projection for item-side residual (input_dim ≠ emb_dim)
+        self.item_residual_proj = nn.Linear(item_input_dim, emb_dim, bias=False)
 
         self._init_weights()
 
@@ -63,6 +77,7 @@ class TwoTowerModel(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 nn.init.zeros_(m.bias)
+        nn.init.kaiming_normal_(self.item_residual_proj.weight, nonlinearity='relu')
 
     def forward(self, *args, **kwargs):
         # Two-tower models don't have a single unified forward pass — the towers
@@ -78,7 +93,7 @@ class TwoTowerModel(nn.Module):
 
     def forward_user(self, user_idx: torch.LongTensor) -> torch.Tensor:
         x = self.user_emb(user_idx)
-        x = self.user_tower(x)
+        x = x + self.user_tower(x)          # residual: identity + learned transform
         return F.normalize(x, p=2, dim=-1)
 
     def forward_item(
@@ -87,12 +102,13 @@ class TwoTowerModel(nn.Module):
         aisle_idx: torch.LongTensor,
         dept_idx: torch.LongTensor,
     ) -> torch.Tensor:
-        x = torch.cat([
+        x_cat = torch.cat([
             self.item_emb(item_idx),
             self.aisle_emb(aisle_idx),
             self.dept_emb(dept_idx),
         ], dim=-1)
-        x = self.item_tower(x)
+        # Residual with linear projection (input_dim → emb_dim)
+        x = self.item_residual_proj(x_cat) + self.item_tower(x_cat)
         return F.normalize(x, p=2, dim=-1)
 
     def get_user_embedding(self, user_idx: torch.LongTensor) -> torch.Tensor:

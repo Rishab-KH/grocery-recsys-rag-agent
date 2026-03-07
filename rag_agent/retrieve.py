@@ -2,15 +2,19 @@
 Hybrid retrieval for the policy RAG pipeline.
 
 Pipeline:
-  query
-   ├── Dense FAISS (text-embedding-3-small)  → top-20
-   └── BM25 sparse (rank_bm25)               → top-20
-        └── RRF fusion                        → top-30
-             └── Cohere Reranker (optional)   → top-k (default 6)
+  query  (composite: intent + departments + aisles + product names)
+   ├── Dense FAISS (text-embedding-3-small)  → top-80
+   └── BM25 sparse (rank_bm25)               → top-80
+        └── RRF fusion                        → scored pool
+             └── Cohere Reranker (optional)   → scored pool
+                  └── Score-blend (RRF + reranker) → top-k
 
-Cohere reranking is optional:
-  - Set COHERE_API_KEY in .env to enable.
-  - If the key is absent, the pipeline returns RRF-fused results directly.
+Design:  Dense and BM25 both search the full index (no doc restriction).
+RRF fusion produces a strong ranking.  The Cohere reranker adds cross-
+encoder signal but uses a *cleaner* query (intent + departments only)
+so structural noise (|, product lists) doesn't confuse it.  Final
+ranking blends normalised RRF and reranker scores, preventing the
+reranker from completely overriding strong lexical+semantic evidence.
 
 EMBED_MODEL must match build_index.py — both use text-embedding-3-small.
 """
@@ -34,10 +38,16 @@ BM25_FILE   = _RAG_DIR / "policy_index" / "bm25.pkl"
 EMBED_MODEL = "text-embedding-3-small"  # must match build_index.py
 
 # ── how many candidates each retriever fetches before fusion / reranking ──
-DENSE_CANDIDATES = 80  # increase candidate pool for reranking
-BM25_CANDIDATES  = 80  # increase candidate pool for reranking
+DENSE_CANDIDATES = 80
+BM25_CANDIDATES  = 80
 RRF_K            = 100   # higher = smoother rank fusion
 RETRIEVAL_CONFIDENCE_THRESHOLD = 0.10
+
+# ── score blending weight ────────────────────────────────────────────────
+# final_score = RERANKER_WEIGHT * reranker_score + (1 - RERANKER_WEIGHT) * norm_rrf
+# 0.6 gives the reranker strong influence while preventing it from
+# completely overriding a top-ranked RRF candidate.
+RERANKER_WEIGHT = 0.6
 
 logger = logging.getLogger(__name__)
 
@@ -97,21 +107,14 @@ def _dense_retrieve(query: str, top_k: int, client: OpenAI) -> list[dict]:
     return results
 
 
-def _bm25_retrieve(query: str, top_k: int, restrict_docs: list[str] = None) -> list[dict]:
-    """Tokenise query → BM25 scores → return top-k chunks, restricted to given docs if provided."""
+def _bm25_retrieve(query: str, top_k: int) -> list[dict]:
+    """Tokenise query → BM25 scores → return top-k chunks (unrestricted)."""
     tokens = _tokenize(query)
     # Keyword boosting for policy terms
     boost_terms = ["promotion", "substitution", "organic", "bulk", "policy", "compliance", "department", "sku"]
     boosted_tokens = tokens + [t for t in boost_terms if t in query.lower()]
     scores = _bm25.get_scores(boosted_tokens)          # shape: (n_chunks,)
-    # Restrict to chunks from routed docs if specified
-    if restrict_docs:
-        restrict_docs_set = set(restrict_docs)
-        valid_indices = [i for i, c in enumerate(_chunks) if c.get("doc") in restrict_docs_set]
-        filtered_scores = [(i, scores[i]) for i in valid_indices]
-        top_indices = [i for i, _ in sorted(filtered_scores, key=lambda x: x[1], reverse=True)[:top_k]]
-    else:
-        top_indices = np.argsort(scores)[::-1][:top_k]
+    top_indices = np.argsort(scores)[::-1][:top_k]
 
     results = []
     for idx in top_indices:
@@ -164,7 +167,7 @@ def _cohere_rerank(
 ) -> list[dict]:
     """
     Cross-encoder reranking via Cohere rerank-english-v3.0.
-    Returns top_k chunks with an added 'score' field (relevance_score).
+    Returns top_k chunks with an added '_reranker_score' field.
 
     Falls back to returning the top_k RRF candidates unchanged if:
       - COHERE_API_KEY is not set
@@ -173,9 +176,8 @@ def _cohere_rerank(
     """
     api_key = os.getenv("COHERE_API_KEY", "")
     if not api_key:
-        # no key — return RRF top-k with rrf_score as the final score
         for c in candidates[:top_k]:
-            c["score"] = round(c.get("_rrf_score", 0.0), 4)
+            c["_reranker_score"] = 0.0
         return candidates[:top_k]
 
     try:
@@ -191,66 +193,155 @@ def _cohere_rerank(
         reranked = []
         for r in response.results:
             chunk = dict(candidates[r.index])
-            chunk["score"] = round(r.relevance_score, 4)
+            chunk["_reranker_score"] = round(r.relevance_score, 4)
             reranked.append(chunk)
         return reranked
 
-    # FIX: catch specific Cohere errors + log, instead of bare except Exception
     except ImportError:
         logger.warning("cohere package not installed — falling back to RRF order")
         for c in candidates[:top_k]:
-            c["score"] = round(c.get("_rrf_score", 0.0), 4)
+            c["_reranker_score"] = 0.0
         return candidates[:top_k]
 
     except Exception as exc:
         logger.warning("Cohere rerank failed (%s: %s) — falling back to RRF order",
                         type(exc).__name__, exc)
         for c in candidates[:top_k]:
-            c["score"] = round(c.get("_rrf_score", 0.0), 4)
+            c["_reranker_score"] = 0.0
         return candidates[:top_k]
 
 
-# ── forced-doc injection ───────────────────────────────────────────────────
-def _inject_forced_chunks(
-    retrieved:   list[dict],
-    forced_docs: list[str],
-    query:       str,
+# ── score blending ─────────────────────────────────────────────────────────
+def _blend_scores(
+    candidates: list[dict],
+    alpha: float = RERANKER_WEIGHT,
 ) -> list[dict]:
     """
-    For each doc in forced_docs not already represented in retrieved,
-    find the best BM25-scored chunk from that doc and append it.
-    Docs missing from the index are silently skipped.
+    Blend normalised RRF scores and reranker scores to produce a final ranking.
 
-    FIX: extract raw intent from the composite query (before the first ' | '
-    separator) so BM25 scoring isn't polluted by structured prefixes like
-    "Departments: ...", "Warnings: ..." that help dense retrieval but add
-    noise to BM25 term matching.
+    final_score = alpha * reranker_score + (1 - alpha) * normalised_rrf_score
+
+    This prevents the reranker from completely overriding strong RRF evidence
+    while still leveraging cross-encoder relevance understanding.
     """
-    present_docs = {c["doc"] for c in retrieved}
+    # Normalise RRF scores to [0, 1]
+    rrf_scores = [c.get("_rrf_score", 0.0) for c in candidates]
+    rrf_max = max(rrf_scores) if rrf_scores else 1.0
+    rrf_min = min(rrf_scores) if rrf_scores else 0.0
+    rrf_range = rrf_max - rrf_min if rrf_max > rrf_min else 1.0
 
-    # Use only the intent portion (before first ' | ') for BM25 scoring
-    # of forced chunks. The structured prefixes help dense retrieval but
-    # add noise to BM25 term matching.
-    intent_portion = query.split(" | ")[0] if " | " in query else query
-    tokens      = _tokenize(intent_portion)
-    bm25_scores = _bm25.get_scores(tokens)
+    blended = []
+    for c in candidates:
+        norm_rrf    = (c.get("_rrf_score", 0.0) - rrf_min) / rrf_range
+        reranker_sc = c.get("_reranker_score", 0.0)
+        c["score"]  = round(alpha * reranker_sc + (1 - alpha) * norm_rrf, 4)
+        blended.append(c)
 
-    result = list(retrieved)
-    for doc in forced_docs:
-        if doc in present_docs:
-            continue
-        candidates = [
-            (i, bm25_scores[i], c)
-            for i, c in enumerate(_chunks)
-            if c["doc"] == doc
-        ]
-        if not candidates:
-            continue   # doc not in index — skip safely
-        best_i, best_score, best_chunk = max(candidates, key=lambda x: x[1])
-        injected = dict(best_chunk)
-        injected["score"] = round(float(best_score), 4)
-        result.append(injected)
-        present_docs.add(doc)
+    blended.sort(key=lambda x: x["score"], reverse=True)
+    return blended
+
+
+# ── reranker query builder ─────────────────────────────────────────────────
+# ── policy-term mapping for richer reranker queries ────────────────────────
+_INTENT_POLICY_TERMS: dict[str, list[str]] = {
+    "substitut": ["substitution policy", "replacement rules"],
+    "promo":     ["promotional pricing", "promotion eligibility"],
+    "bulk":      ["bulk order limits", "quantity caps"],
+    "deliver":   ["delivery windows", "fulfillment schedule"],
+    "cold":      ["cold chain", "temperature compliance"],
+    "refund":    ["refund policy", "return rules"],
+    "organic":   ["organic certification", "organic preferences"],
+    "perishab":  ["perishable handling", "delivery windows for perishables"],
+    "frozen":    ["frozen storage", "cold chain compliance"],
+}
+
+
+def build_reranker_query(composite_query: str) -> str:
+    """
+    Build a cleaner, natural-language query for the Cohere cross-encoder.
+
+    The composite query uses '|' delimiters and long product lists that
+    confuse cross-encoders.  Extract the intent and departments,
+    discover policy-relevant terms from the intent, and rephrase as
+    natural English for better relevance matching.
+    """
+    parts = [p.strip() for p in composite_query.split(" | ")]
+    intent = parts[0] if parts else composite_query
+
+    departments = ""
+    for p in parts:
+        if p.startswith("Departments:"):
+            departments = p.replace("Departments:", "").strip()
+            break
+
+    # Discover policy-relevant terms from the intent
+    intent_lower = intent.lower()
+    extra_terms: list[str] = []
+    for trigger, terms in _INTENT_POLICY_TERMS.items():
+        if trigger in intent_lower:
+            extra_terms.extend(terms)
+
+    base = f"Policy compliance rules for {departments} departments" if departments else "Policy compliance rules"
+    result = f"{base}. Customer intent: {intent}"
+    if extra_terms:
+        result += ". Relevant policies: " + ", ".join(dict.fromkeys(extra_terms))  # deduplicate
+    return result
+
+
+# ── department-affinity penalty ────────────────────────────────────────────
+# Map from dept policy filename stems to the department names that appear
+# in the query's "Departments: …" field.  E.g. "dept_dairy_eggs" matches
+# "dairy eggs", "dairy", or "eggs".
+_DEPT_FILE_TO_KEYWORDS: dict[str, list[str]] = {
+    "dept_produce":    ["produce"],
+    "dept_dairy_eggs": ["dairy", "eggs", "dairy eggs"],
+    "dept_frozen":     ["frozen"],
+    "dept_snacks":     ["snacks"],
+    "dept_meat":       ["meat", "seafood", "meat seafood"],
+}
+
+DEPT_MISMATCH_PENALTY = 0.25   # multiply score by this if department doesn't match
+
+
+def _apply_dept_affinity(candidates: list[dict], composite_query: str) -> list[dict]:
+    """
+    Penalise department-specific chunks (dept_*.md) whose department does
+    not match any department in the query.  General policy docs (substitutions,
+    bulk_limits, delivery_windows, etc.) are unaffected.
+
+    This is a soft signal — mismatched dept docs still appear if nothing
+    better is available, but they won't outrank relevant general docs.
+    """
+    # Extract departments from query
+    query_depts: set[str] = set()
+    for part in composite_query.split(" | "):
+        if part.strip().startswith("Departments:"):
+            dept_str = part.strip().replace("Departments:", "").strip().lower()
+            query_depts = {d.strip() for d in dept_str.split(",")}
+            break
+
+    if not query_depts:
+        return candidates
+
+    result = []
+    for c in candidates:
+        doc = c.get("doc", "")
+        stem = doc.replace(".md", "")          # e.g. "dept_frozen"
+
+        if stem in _DEPT_FILE_TO_KEYWORDS:
+            # Check if any keyword matches any query department
+            keywords = _DEPT_FILE_TO_KEYWORDS[stem]
+            matches = any(
+                kw in qd or qd in kw
+                for kw in keywords
+                for qd in query_depts
+            )
+            if not matches:
+                c = dict(c)
+                c["score"] = round(c.get("score", 0.0) * DEPT_MISMATCH_PENALTY, 4)
+        result.append(c)
+
+    result.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return result
 
 
@@ -289,12 +380,16 @@ def retrieve(
     query:       str,
     top_k:       int = 6,
     client:      Optional[OpenAI] = None,
-    forced_docs: list[str] | None = None,
 ) -> dict:
     """
-    Full hybrid retrieval pipeline:
-      dense FAISS + BM25  →  RRF fusion  →  Cohere rerank (if key set)
-      → forced-doc injection (if forced_docs provided)
+    Full hybrid retrieval pipeline (no forced-doc injection):
+      dense FAISS + BM25 → RRF fusion → Cohere rerank → score blend
+      → department-affinity penalty → doc-diversity cap → top-k
+
+    The reranker receives a cleaner natural-language query (intent +
+    departments only) to avoid confusion from |‑delimited product lists.
+    Final ranking blends normalised RRF and reranker scores so the
+    reranker adds signal without completely overriding strong RRF evidence.
 
     Returns:
     {
@@ -302,20 +397,32 @@ def retrieve(
         "confidence": float,
         "low_confidence": bool,
     }
-    chunks include top_k plus one chunk per forced doc not already present.
     """
     _ensure_loaded()
     if client is None:
         client = OpenAI()
 
-    dense    = _dense_retrieve(query, top_k=DENSE_CANDIDATES, client=client)
-    sparse   = _bm25_retrieve(query,  top_k=BM25_CANDIDATES, restrict_docs=forced_docs)
-    fused    = _rrf_fuse(dense, sparse)
-    # Tune reranker: increase top_k to 8 for more evidence, then filter to top 5 for answer
-    reranked = _cohere_rerank(query, fused, top_k=8)
+    # Stage 1–3: dense + BM25 → RRF fusion (both search full index)
+    dense  = _dense_retrieve(query, top_k=DENSE_CANDIDATES, client=client)
+    sparse = _bm25_retrieve(query,  top_k=BM25_CANDIDATES)
+    fused  = _rrf_fuse(dense, sparse)
 
-    # Return top 3–5 policy chunks with doc_name, chunk_text, chunk_id
-    confidence = float(max((c.get("score", 0.0) for c in reranked), default=0.0))
+    # Stage 4: Cohere reranker with a cleaner query
+    reranker_query = build_reranker_query(query)
+    reranked = _cohere_rerank(reranker_query, fused, top_k=min(20, len(fused)))
+
+    # Stage 5: blend RRF + reranker scores for final ranking
+    blended = _blend_scores(reranked)
+
+    # Stage 6: department-affinity penalty
+    # If a chunk is from a dept_*.md file whose department doesn't match
+    # any of the user's departments, penalise its score.  This prevents
+    # e.g. dept_frozen.md from outranking substitutions.md when the user
+    # has no frozen items.  General (non-dept) docs are unaffected.
+    blended = _apply_dept_affinity(blended, query)
+
+    confidence = float(max((c.get("score", 0.0) for c in blended), default=0.0))
+    low_confidence = confidence < RETRIEVAL_CONFIDENCE_THRESHOLD
     low_confidence = confidence < RETRIEVAL_CONFIDENCE_THRESHOLD
     if low_confidence:
         logger.warning("Low-confidence retrieval: no relevant policy evidence found")
@@ -325,12 +432,22 @@ def retrieve(
             "low_confidence": True,
         }
 
-    if forced_docs:
-        reranked = _inject_forced_chunks(reranked, forced_docs, query)
+    # ── doc-diversity selection ─────────────────────────────────────────
+    # Cap chunks per source document to ensure broad coverage.
+    # Walk blended list in score order; skip a chunk if its source doc
+    # already has MAX_PER_DOC chunks selected.
+    MAX_PER_DOC = 2
+    doc_counts: dict[str, int] = {}
+    final_chunks: list[dict] = []
+    for c in blended:
+        if len(final_chunks) >= top_k:
+            break
+        doc = c.get("doc", "")
+        if doc_counts.get(doc, 0) < MAX_PER_DOC:
+            final_chunks.append(c)
+            doc_counts[doc] = doc_counts.get(doc, 0) + 1
 
-    # strip internal scoring fields before returning
-    _internal = {"_dense_score", "_bm25_score", "_rrf_score", "_idx"}
-    # Filter to top 5 by reranker score for answer generation
+    # Strip internal scoring fields before returning
     chunks = [
         {
             "doc": c.get("doc"),
@@ -338,7 +455,7 @@ def retrieve(
             "text": c.get("text"),
             "score": c.get("score", 0.0)
         }
-        for c in sorted(reranked, key=lambda x: x.get("score", 0.0), reverse=True)[:5]
+        for c in final_chunks
         if c.get("doc") and c.get("text")
     ]
     return {

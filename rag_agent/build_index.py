@@ -37,8 +37,7 @@ CHUNKS_FILE = INDEX_DIR / "chunks.jsonl"
 BM25_FILE   = INDEX_DIR / "bm25.pkl"
 
 EMBED_MODEL   = "text-embedding-3-small"
-CHUNK_SIZE    = 900    # chars; smaller chunks for finer retrieval
-CHUNK_OVERLAP = 450    # chars; more overlap for better recall
+MAX_CHUNK_CHARS = 1200   # hard ceiling per chunk; only splits if a section exceeds this
 
 
 # ── policy directory resolution ────────────────────────────────────────────
@@ -60,31 +59,147 @@ def _resolve_policies_dir(override: str | None = None) -> Path:
 
 
 # ── chunking ───────────────────────────────────────────────────────────────
+def _split_long_section(text: str, doc: str, section_header: str,
+                        max_chars: int) -> list[str]:
+    """
+    Split a single section that exceeds max_chars into sub-chunks.
+    Breaks at paragraph boundaries (double newline) or bullet points,
+    prepending the section header to every sub-chunk so context is preserved.
+    """
+    prefix = section_header.strip() + "\n"
+    # Split by paragraphs / bullet groups first
+    paragraphs = re.split(r'\n\n+', text)
+    sub_chunks: list[str] = []
+    current = prefix
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        # Would adding this paragraph exceed the limit?
+        if len(current) + len(para) + 2 > max_chars and len(current) > len(prefix):
+            sub_chunks.append(current.strip())
+            current = prefix  # restart with header
+        current += para + "\n\n"
+
+    if current.strip() and current.strip() != prefix.strip():
+        sub_chunks.append(current.strip())
+
+    # Edge case: single paragraph that itself is too long — fall back to
+    # sentence-level splitting
+    final: list[str] = []
+    for sc in sub_chunks:
+        if len(sc) <= max_chars:
+            final.append(sc)
+        else:
+            # Split by sentences (period + space or newline)
+            sentences = re.split(r'(?<=[.!?])\s+|\n', sc)
+            buf = prefix
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+                if len(buf) + len(sent) + 1 > max_chars and len(buf) > len(prefix):
+                    final.append(buf.strip())
+                    buf = prefix
+                buf += sent + " "
+            if buf.strip() and buf.strip() != prefix.strip():
+                final.append(buf.strip())
+
+    return final if final else [text.strip()]
+
+
 def chunk_text(text: str, doc: str) -> list[dict]:
     """
-    Split text into overlapping character-level chunks.
-    Prefers to break at newlines near the boundary so policy bullet points
-    and table rows stay intact.
+    Semantic markdown-section chunking:
+      1. Split on ## headers — each section becomes a candidate chunk.
+      2. Prepend the doc title (# heading) and section heading to every chunk
+         so each chunk is self-contained with full context.
+      3. If a section exceeds MAX_CHUNK_CHARS, split further at paragraph
+         boundaries while repeating the section header.
+      4. Tiny consecutive sections (< 200 chars) are merged together.
+
+    This produces fewer, more coherent chunks than character-level splitting
+    and eliminates mid-sentence breaks and orphaned bullet points.
     """
     chunks: list[dict] = []
-    start    = 0
+
+    # Extract document title (first # line)
+    title_match = re.match(r'^(#\s+.+?)(?:\n|$)', text, re.MULTILINE)
+    doc_title = title_match.group(1).strip() if title_match else ""
+    title_prefix = doc_title + "\n\n" if doc_title else ""
+
+    # Split into sections by ## headers
+    # This produces pairs: (header_or_empty, body_text)
+    section_splits = re.split(r'(^##\s+.+$)', text, flags=re.MULTILINE)
+
+    # Build list of (header, body) tuples
+    sections: list[tuple[str, str]] = []
+    i = 0
+    # Content before first ## is preamble (usually just the # title + scope)
+    if section_splits and not section_splits[0].startswith('## '):
+        preamble = section_splits[0].strip()
+        if preamble:
+            sections.append(("", preamble))
+        i = 1
+
+    while i < len(section_splits):
+        header = section_splits[i].strip() if i < len(section_splits) else ""
+        body = section_splits[i + 1].strip() if i + 1 < len(section_splits) else ""
+        if header or body:
+            sections.append((header, body))
+        i += 2
+
+    # Merge and chunk
+    MIN_MERGE_CHARS = 200
     chunk_id = 0
+    merge_buf_header = ""
+    merge_buf_text = ""
 
-    while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
+    def _flush(header: str, body: str) -> None:
+        nonlocal chunk_id
+        # Build chunk text: doc_title + section_header + body
+        # Skip title prefix for preamble chunks that already contain it
+        if not header and body.startswith(doc_title):
+            full_text = body
+        else:
+            full_text = (title_prefix + header + "\n" + body).strip() if header else (title_prefix + body).strip()
 
-        # prefer a newline break in the last 25% of the window
-        if end < len(text):
-            nl = text.rfind("\n", start + int(CHUNK_SIZE * 0.75), end)
-            if nl != -1:
-                end = nl + 1
-
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append({"doc": doc, "chunk_id": chunk_id, "text": chunk})
+        if len(full_text) <= MAX_CHUNK_CHARS:
+            chunks.append({"doc": doc, "chunk_id": chunk_id, "text": full_text})
             chunk_id += 1
+        else:
+            # Section too long — split at paragraphs
+            sub_chunks = _split_long_section(
+                body, doc, title_prefix + header, MAX_CHUNK_CHARS
+            )
+            for sc in sub_chunks:
+                chunks.append({"doc": doc, "chunk_id": chunk_id, "text": sc})
+                chunk_id += 1
 
-        start = end - CHUNK_OVERLAP if end < len(text) else len(text)
+    for header, body in sections:
+        combined_len = len(merge_buf_text) + len(body) + len(header) + len(title_prefix)
+
+        # If this section is tiny, try merging with previous
+        if len(body) < MIN_MERGE_CHARS and combined_len <= MAX_CHUNK_CHARS:
+            if merge_buf_text:
+                merge_buf_text += "\n\n" + header + "\n" + body
+            else:
+                merge_buf_header = header
+                merge_buf_text = body
+            continue
+
+        # Flush any accumulated merge buffer first
+        if merge_buf_text:
+            _flush(merge_buf_header, merge_buf_text)
+            merge_buf_header = ""
+            merge_buf_text = ""
+
+        _flush(header, body)
+
+    # Flush final merge buffer
+    if merge_buf_text:
+        _flush(merge_buf_header, merge_buf_text)
 
     return chunks
 

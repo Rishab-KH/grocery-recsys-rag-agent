@@ -230,7 +230,8 @@ All metrics, token counts, costs, and timings logged per-run to MLflow and `demo
 | **GBM reranker (gradient boosted trees, negative sampling, 3 ranking features, top-20 candidates)** | 0.1369 | 0.1423 | 0.1427 | 0.1326 | +95.9% |
 | **Two-Tower retrieval + content embeddings (aisle + department features, MLP towers)** | 0.1451 | 0.1742 | 0.2073 | 0.1854 | +107.6% |
 | **GBM reranker with expanded feature set (6 ranking features, top-200 candidate reranking)** | 0.1819 | 0.2315 | 0.2073 | 0.2179 | +160.2% |
-| **LightGBM Learning-to-Rank reranker (LambdaRank objective)** | **0.2160** | **0.2543** | **0.2850** | **0.2639** | **+209.0%** |
+| **LightGBM Learning-to-Rank reranker (LambdaRank objective)** | 0.2160 | 0.2543 | 0.2850 | 0.2639 | +209.0% |
+| **Deep Two-Tower v2 + LambdaRank reranker (3-layer MLPs, GELU, LayerNorm, residual connections, 35% hard-neg mining)** | **0.2400** | **0.2751** | **0.3268** | **0.2919** | **★ +243.3%** |
 
 All results are reported on a held-out test set of 206,209 users.
 
@@ -242,6 +243,9 @@ All results are reported on a held-out test set of 206,209 users.
 | **Training** | Hard negative mining, popularity debiasing, temporal validation, patience 4 | Better separation, unbiased loss, no future leakage |
 | **Retrieval** | Candidate pool 20→200, FAISS-only, dynamic `emb_dim` from checkpoint | Higher recall ceiling, reliable ANN, config-free inference |
 | **Reranker** | 3→6 features (reorder rate, user stats), train on val / eval on test | Stronger intent signal, no label leakage |
+| **Architecture v2** | 2→3-layer MLP towers, ReLU→GELU activation, added LayerNorm after each linear layer | Smoother gradients, deeper non-linear projection, stable training with hard negatives |
+| **Residual connections** | User tower: `x + tower(x)`; Item tower: linear projection residual for dimension mismatch | Preserves embedding identity, prevents gradient degradation in deeper towers |
+| **Hard-neg mining** | Increased mining sample fraction from 15%→35% of training users each epoch | Richer adversarial signal, better separation of near-miss items |
 
 ### RAG Agent Metrics (Latest Run)
 
