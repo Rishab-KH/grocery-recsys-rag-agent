@@ -385,7 +385,7 @@ python -m src.train
 | `--emb_dim` | `128` | Embedding dimension |
 | `--hidden_dim` | `256` | MLP hidden size |
 | `--batch_size` | `4096` | Training batch size |
-| `--epochs` | `8` | Max epochs |
+| `--epochs` | `12` | Max epochs |
 | `--k_retrieve` | `200` | FAISS candidate pool |
 
 ### 3. Run inference
