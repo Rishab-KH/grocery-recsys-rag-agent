@@ -64,24 +64,24 @@ A production-grade grocery recommendation platform combining a **two-tower neura
 ### Two-Tower Model
 
 ```
-     ┌──────────────────────┐        ┌──────────────────────────────┐
-     │  USER TOWER           │        │  ITEM TOWER (content-aware)  │
+     ┌───────────────────────┐        ┌──────────────────────────────┐
+     │      USER TOWER       │        │  ITEM TOWER (content-aware)  │
      │                       │        │                              │
-     │  user_id              │        │  item_id + aisle_id + dept_id│
-     │     │                 │        │     │                        │
-     │  Embed(128)           │        │  Embed concat                │
-     │     │                 │        │  (128 + 32 + 16 = 176)       │
-     │  Linear(128→256)      │        │  Linear(176→256)             │
-     │  LayerNorm → GELU     │        │  LayerNorm → GELU            │
-     │  Dropout(0.15)        │        │  Dropout(0.15)               │
-     │  Linear(256→256)      │        │  Linear(256→256)             │
-     │  LayerNorm → GELU     │        │  LayerNorm → GELU            │
-     │  Dropout(0.1)         │        │  Dropout(0.1)                │
-     │  Linear(256→128)      │        │  Linear(256→128)             │
-     │     │                 │        │     │                        │
-     │  + residual (identity)│        │  + residual (linear proj)    │
-     │  L2-Norm              │        │  L2-Norm                     │
-     └──────────┬────────────┘        └──────────────┬───────────────┘
+     │       user_id         │        │  item_id + aisle_id + dept_id│
+     │          │            │        │             │                │
+     │      Embed(128)       │        │        Embed concat          │
+     │          │            │        │     (128 + 32 + 16 = 176)    │
+     │    Linear(128→256)    │        │       Linear(176→256)        │
+     │    LayerNorm → GELU   │        │      LayerNorm → GELU        │
+     │     Dropout(0.15)     │        │        Dropout(0.15)         │
+     │    Linear(256→256)    │        │       Linear(256→256)        │
+     │    LayerNorm → GELU   │        │       LayerNorm → GELU       │
+     │     Dropout(0.1)      │        │        Dropout(0.1)          │
+     │    Linear(256→128)    │        │       Linear(256→128)        │
+     │          │            │        │             │                │
+     │  + residual (identity)│        │     + residual (linear proj) │
+     │  L2-Norm              │        │           L2-Norm            │
+     └──────────┬────────────┘        └───────────────┬──────────────┘
                 └────────────────┬────────────────────┘
                                  ▼
                       InfoNCE Loss (NT-Xent)
